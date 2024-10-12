@@ -86,19 +86,23 @@ class PoseTrajectoryFiller:
         tstamps = []
         images = []
         intrinsics = []
-        
-        for (tstamp, image, intrinsic) in image_stream:
+        stamps = []
+        frame_stamps = []
+        for (tstamp, image, intrinsic, stamp) in image_stream:
             tstamps.append(tstamp)
             images.append(image)
             intrinsics.append(intrinsic)
+            stamps.append(stamp)
 
             if len(tstamps) == 16:
                 pose_list += self.__fill(tstamps, images, intrinsics)
-                tstamps, images, intrinsics = [], [], []
+                frame_stamps.extend(stamps)
+                tstamps, images, intrinsics, stamps = [], [], [], []
 
         if len(tstamps) > 0:
             pose_list += self.__fill(tstamps, images, intrinsics)
+            frame_stamps.extend(stamps)
 
         # stitch pose segments together
-        return lietorch.cat(pose_list, 0)
+        return lietorch.cat(pose_list, 0), frame_stamps
 

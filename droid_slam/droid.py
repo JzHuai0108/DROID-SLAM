@@ -84,6 +84,6 @@ class Droid:
         print("#" * 32)
         self.backend(12)
 
-        camera_trajectory = self.traj_filler(stream)
-        return camera_trajectory.inv().data.cpu().numpy()
+        camera_trajectory, frame_stamps = self.traj_filler(stream)
+        return camera_trajectory.inv().data.cpu().numpy(), frame_stamps
 

@@ -10,6 +10,7 @@ import os
 import glob 
 import time
 import argparse
+import yaml
 
 from torch.multiprocessing import Process
 from droid import Droid
@@ -24,6 +25,10 @@ def show_image(image):
 
 def image_stream(imagedir, calib, stride):
     """ image generator """
+    if 'rrxio' in imagedir:
+        for t, image, intrinsics, stamp in rrxio_stream(imagedir, calib, stride):
+            yield t, image, intrinsics, stamp
+        return
 
     calib = np.loadtxt(calib, delimiter=" ")
     fx, fy, cx, cy = calib[:4]
@@ -53,7 +58,132 @@ def image_stream(imagedir, calib, stride):
         intrinsics[0::2] *= (w1 / w0)
         intrinsics[1::2] *= (h1 / h0)
 
-        yield t, image[None], intrinsics
+        yield t, image[None], intrinsics, t
+
+
+def rrxio_stream(imagedir, calib_yaml, stride, skip=0):
+    image_list = sorted(os.listdir(imagedir))[::stride]
+
+    with open(calib_yaml, 'r') as file:
+        config = yaml.safe_load(file)
+    raw_calib = config['Dataset']['Calibration']['raw']
+    img_topic = config['Dataset']['img_topic']
+    raw_K = np.eye(3)
+    raw_K[0,0] = raw_calib['fx']
+    raw_K[0,2] = raw_calib['cx']
+    raw_K[1,1] = raw_calib['fy']
+    raw_K[1,2] = raw_calib['cy']
+    width = raw_calib['width']
+    height = raw_calib['height']
+
+    opt_calib = config['Dataset']['Calibration']['opt']
+    opt_K = np.eye(3)
+    opt_K[0,0] = opt_calib['fx']
+    opt_K[0,2] = opt_calib['cx']
+    opt_K[1,1] = opt_calib['fy']
+    opt_K[1,2] = opt_calib['cy']
+
+    if 'distortion_model' in raw_calib.keys():
+        distortion_model = raw_calib['distortion_model']
+    else:
+        distortion_model = None
+    print(f"Distortion model: {distortion_model}")
+
+    if distortion_model == 'radtan':
+        dist_coeffs = np.array(
+            [
+                raw_calib["k1"],
+                raw_calib["k2"],
+                raw_calib["p1"],
+                raw_calib["p2"],
+                raw_calib["k3"],
+            ]
+        )
+        map1x, map1y = cv2.initUndistortRectifyMap(
+            raw_K,
+            dist_coeffs,
+            np.eye(3),
+            opt_K,
+            (width, height),
+            cv2.CV_32FC1,
+        )
+    elif distortion_model == 'equidistant':
+        dist_coeffs = np.array(
+            [
+                raw_calib["k1"],
+                raw_calib["k2"],
+                raw_calib["k3"],
+                raw_calib["k4"]
+            ]
+        )
+        map1x, map1y = cv2.fisheye.initUndistortRectifyMap(
+            raw_K,
+            dist_coeffs,
+            np.eye(3),
+            opt_K,
+            (width, height),
+            cv2.CV_32FC1,
+        )
+    else:
+        map1x, map1y = None, None
+
+    for t, imfile in enumerate(image_list):
+        image = cv2.imread(os.path.join(imagedir, imfile))
+        if image.shape[2] == 1:
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb_image = image
+
+        # Display the image (optional)
+        cv2.imshow('Image', rgb_image)
+        cv2.waitKey(1)  # Adjust the delay as needed (e.g., for video playback)
+
+        time = float(imfile[:-4])
+        if distortion_model is None:
+            undistorted_image = rgb_image
+        else:
+            undistorted_image = cv2.remap(rgb_image, map1x, map1y, cv2.INTER_LINEAR, cv2.BORDER_CONSTANT)
+
+        h0, w0, _ = undistorted_image.shape
+        h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
+        w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
+
+        undistorted_image = cv2.resize(undistorted_image, (w1, h1))
+        undistorted_image = undistorted_image[:h1-h1%8, :w1-w1%8]
+        undistorted_image = torch.as_tensor(undistorted_image).permute(2, 0, 1)
+
+        intrinsics = torch.as_tensor([opt_calib['fx'], opt_calib['fy'], opt_calib['cx'], opt_calib['cy']])
+        intrinsics[0::2] *= (w1 / w0)
+        intrinsics[1::2] *= (h1 / h0)
+
+        yield t, undistorted_image[None], intrinsics, time
+
+
+def save_tum_traj(traj: np.ndarray, times: list, outfile: str):
+    """
+    Writes a trajectory and corresponding times to a TUM format file.
+
+    Args:
+        traj (np.ndarray): Nx7 array containing the trajectory data, where each row is [x, y, z, qx, qy, qz, qw].
+        times (list): List of time stamps (Nx1) corresponding to the trajectory points.
+        outfile (str): Output file path to save the trajectory data.
+
+    Each line in the output file will have the format:
+    time x y z qx qy qz qw
+    """
+    # Ensure that the trajectory and times have matching lengths
+    if traj.shape[0] != len(times):
+        raise ValueError("The length of times and the number of trajectory points must be the same.")
+
+    # Open the file for writing
+    with open(outfile, 'w') as f:
+        for i in range(len(times)):
+            # Extract time and trajectory data for the current step
+            time = times[i]
+            x, y, z, qx, qy, qz, qw = traj[i]
+
+            # Write the time and trajectory in TUM format
+            f.write(f"{time:.9f} {x:.6f} {y:.6f} {z:.6f} {qx:.9f} {qy:.9f} {qz:.9f} {qw:.9f}\n")
 
 
 def save_reconstruction(droid, reconstruction_path):
@@ -103,6 +233,7 @@ if __name__ == '__main__':
     parser.add_argument("--backend_nms", type=int, default=3)
     parser.add_argument("--upsample", action="store_true")
     parser.add_argument("--reconstruction_path", help="path to saved reconstruction")
+    parser.add_argument("--traj_path", help="path to saved trajectory")
     args = parser.parse_args()
 
     args.stereo = False
@@ -115,7 +246,7 @@ if __name__ == '__main__':
         args.upsample = True
 
     tstamps = []
-    for (t, image, intrinsics) in tqdm(image_stream(args.imagedir, args.calib, args.stride)):
+    for (t, image, intrinsics, stamp) in tqdm(image_stream(args.imagedir, args.calib, args.stride)):
         if t < args.t0:
             continue
 
@@ -131,4 +262,11 @@ if __name__ == '__main__':
     if args.reconstruction_path is not None:
         save_reconstruction(droid, args.reconstruction_path)
 
-    traj_est = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
+    se3_traj, frame_stamps = droid.traj_filler(image_stream(args.imagedir, args.calib, args.stride))
+    traj_est = se3_traj.inv().data.cpu().numpy()
+    traj_est_lc, frame_stamps = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
+    if args.traj_path is not None:
+        save_tum_traj(traj_est, frame_stamps, args.traj_path)
+        traj_path_lc = args.traj_path[:-4] + '_lc' + args.traj_path[-4:]
+        save_tum_traj(traj_est_lc, frame_stamps, traj_path_lc)
+    print('Done')
